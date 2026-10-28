@@ -11,8 +11,8 @@ use super::cg_color_space::{
 };
 use super::cg_context::{
     kCGBlendModeCopy, kCGBlendModeDarken, kCGBlendModeLighten, kCGBlendModeMultiply,
-    kCGBlendModeNormal, kCGBlendModeScreen, CGBlendMode, CGContextHostObject, CGContextRef,
-    CGContextSubclass,
+    kCGBlendModeNormal, kCGBlendModeScreen, kCGBlendModeSourceAtop, kCGBlendModeSourceIn,
+    CGBlendMode, CGContextHostObject, CGContextRef, CGContextSubclass,
 };
 use super::cg_image::{
     self, kCGBitmapAlphaInfoMask, kCGBitmapByteOrderMask, kCGImageAlphaFirst, kCGImageAlphaLast,
@@ -90,6 +90,7 @@ pub fn CGBitmapContextCreate(
         font_size: 14.0,
         transform: CGAffineTransformIdentity,
         blend_mode: kCGBlendModeNormal,
+        alpha: 1.0,
         text_transform: None,
         state_stack: Vec::new(),
     };
@@ -251,6 +252,17 @@ fn blend_premultiplied(
     if blend_mode == kCGBlendModeCopy {
         return fg;
     }
+    if blend_mode == kCGBlendModeSourceIn {
+        return (fg.0 * bg.3, fg.1 * bg.3, fg.2 * bg.3, fg.3 * bg.3);
+    }
+    if blend_mode == kCGBlendModeSourceAtop {
+        return (
+            fg.0 * bg.3 + bg.0 * (1.0 - fg.3),
+            fg.1 * bg.3 + bg.1 * (1.0 - fg.3),
+            fg.2 * bg.3 + bg.2 * (1.0 - fg.3),
+            bg.3,
+        );
+    }
     // Blend
     let blend_res = match blend_mode {
         kCGBlendModeNormal => (bg.3 * fg.0, bg.3 * fg.1, bg.3 * fg.2),
@@ -407,12 +419,70 @@ fn put_pixel(
     }
 }
 
+#[test]
+fn test_source_in() {
+    let fg = (0.4, 0.2, 0.1, 0.5);
+    assert_eq!(
+        blend_premultiplied((0.1, 0.1, 0.1, 0.5), fg, kCGBlendModeSourceIn),
+        (0.2, 0.1, 0.05, 0.25)
+    );
+    assert_eq!(
+        blend_premultiplied((0.0, 0.0, 0.0, 0.0), fg, kCGBlendModeSourceIn),
+        (0.0, 0.0, 0.0, 0.0)
+    );
+    assert_eq!(
+        blend_premultiplied((0.0, 0.0, 0.0, 1.0), fg, kCGBlendModeSourceIn),
+        fg
+    );
+}
+
+#[test]
+fn test_source_atop() {
+    let fg = (0.5, 0.0, 0.0, 0.5);
+    let bg = (0.0, 0.0, 0.5, 0.5);
+    assert_eq!(
+        blend_premultiplied(bg, fg, kCGBlendModeSourceAtop),
+        (0.25, 0.0, 0.25, 0.5)
+    );
+    assert_eq!(
+        blend_premultiplied((0.0, 0.0, 0.0, 0.0), fg, kCGBlendModeSourceAtop),
+        (0.0, 0.0, 0.0, 0.0)
+    );
+}
+
+fn apply_global_alpha(
+    pixel: (CGFloat, CGFloat, CGFloat, CGFloat),
+    alpha: CGFloat,
+    premultiplied: bool,
+) -> (CGFloat, CGFloat, CGFloat, CGFloat) {
+    if premultiplied {
+        (
+            pixel.0 * alpha,
+            pixel.1 * alpha,
+            pixel.2 * alpha,
+            pixel.3 * alpha,
+        )
+    } else {
+        (pixel.0, pixel.1, pixel.2, pixel.3 * alpha)
+    }
+}
+
+#[test]
+fn test_global_alpha() {
+    let pixel = (0.4, 0.2, 0.1, 0.5);
+    assert_eq!(apply_global_alpha(pixel, 1.0, true), pixel);
+    assert_eq!(apply_global_alpha(pixel, 0.5, true), (0.2, 0.1, 0.05, 0.25));
+    assert_eq!(apply_global_alpha(pixel, 0.5, false), (0.4, 0.2, 0.1, 0.25));
+    assert_eq!(apply_global_alpha(pixel, 0.0, true), (0.0, 0.0, 0.0, 0.0));
+}
+
 /// Abstract interface for use by host code that wants to draw in a bitmap
 /// context.
 pub struct CGBitmapContextDrawer<'a> {
     bitmap_info: CGBitmapContextData,
     rgb_fill_color: (CGFloat, CGFloat, CGFloat, CGFloat),
     blend_mode: CGBlendMode,
+    alpha: CGFloat,
     transform: CGAffineTransform,
     pixels: &'a mut [u8],
 }
@@ -427,6 +497,7 @@ impl CGBitmapContextDrawer<'_> {
             rgb_fill_color,
             transform,
             blend_mode,
+            alpha,
             ..
         } = objc.borrow(context);
 
@@ -436,6 +507,7 @@ impl CGBitmapContextDrawer<'_> {
             bitmap_info,
             rgb_fill_color,
             blend_mode,
+            alpha,
             transform,
             pixels,
         }
@@ -473,6 +545,16 @@ impl CGBitmapContextDrawer<'_> {
         color: (CGFloat, CGFloat, CGFloat, CGFloat),
         blend: bool,
     ) {
+        let color = if blend {
+            let premultiplied = matches!(
+                self.bitmap_info.alpha_info,
+                kCGImageAlphaPremultipliedLast | kCGImageAlphaPremultipliedFirst
+            );
+            apply_global_alpha(color, self.alpha, premultiplied)
+        } else {
+            // CGContextClearRect ignores the graphics state's alpha.
+            color
+        };
         put_pixel(
             &self.bitmap_info,
             self.pixels,
@@ -551,6 +633,7 @@ fn test_iter_transformed_pixels() {
             },
             rgb_fill_color: (0.0, 0.0, 0.0, 0.0),
             blend_mode: kCGBlendModeNormal,
+            alpha: 1.0,
             transform,
             pixels: &mut [],
         }

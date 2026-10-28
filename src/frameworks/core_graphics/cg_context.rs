@@ -39,6 +39,8 @@ pub const kCGBlendModeOverlay: CGBlendMode = 3;
 pub const kCGBlendModeDarken: CGBlendMode = 4;
 pub const kCGBlendModeLighten: CGBlendMode = 5;
 pub const kCGBlendModeCopy: CGBlendMode = 17;
+pub const kCGBlendModeSourceIn: CGBlendMode = 18;
+pub const kCGBlendModeSourceAtop: CGBlendMode = 20;
 
 pub const CLASSES: ClassExports = objc_classes! {
 
@@ -71,6 +73,7 @@ type ContextState = (
     CGFontRef,                            // font
     CGFloat,                              // font size
     CGBlendMode,                          // blend mode
+    CGFloat,                              // global alpha
 );
 
 pub(super) struct CGContextHostObject {
@@ -81,6 +84,7 @@ pub(super) struct CGContextHostObject {
     /// Current transform.
     pub(super) transform: CGAffineTransform,
     pub(super) blend_mode: CGBlendMode,
+    pub(super) alpha: CGFloat,
     /// Text transform.
     pub(super) text_transform: Option<CGAffineTransform>,
     pub(super) state_stack: Vec<ContextState>,
@@ -110,6 +114,10 @@ fn CGContextSetBlendMode(env: &mut Environment, context: CGContextRef, blend_mod
     env.objc
         .borrow_mut::<CGContextHostObject>(context)
         .blend_mode = blend_mode;
+}
+
+fn CGContextSetAlpha(env: &mut Environment, context: CGContextRef, alpha: CGFloat) {
+    env.objc.borrow_mut::<CGContextHostObject>(context).alpha = alpha.clamp(0.0, 1.0);
 }
 
 fn CGContextSetFillColorSpace(
@@ -238,6 +246,26 @@ pub fn CGContextGetCTM(env: &mut Environment, context: CGContextRef) -> CGAffine
     log_dbg!("CGContextGetCTM() => {:?}", res);
     res
 }
+fn CGContextGetUserSpaceToDeviceSpaceTransform(
+    env: &mut Environment,
+    context: CGContextRef,
+) -> CGAffineTransform {
+    // All contexts currently use bitmap coordinates as device coordinates.
+    CGContextGetCTM(env, context)
+}
+
+fn CGContextGetClipBoundingBox(env: &mut Environment, context: CGContextRef) -> CGRect {
+    // CGContextClipToRect currently only accepts the full bitmap extent.
+    let rect = CGRect {
+        origin: CGPointZero,
+        size: CGSize {
+            width: CGBitmapContextGetWidth(env, context) as CGFloat,
+            height: CGBitmapContextGetHeight(env, context) as CGFloat,
+        },
+    };
+    CGContextGetCTM(env, context).invert().apply_to_rect(rect)
+}
+
 pub fn CGContextRotateCTM(env: &mut Environment, context: CGContextRef, angle: CGFloat) {
     log_dbg!("CGContextRotateCTM({:?})", angle);
     let host_obj = env.objc.borrow_mut::<CGContextHostObject>(context);
@@ -276,6 +304,7 @@ fn CGContextSaveGState(env: &mut Environment, context: CGContextRef) {
         host_obj.font,
         host_obj.font_size,
         host_obj.blend_mode,
+        host_obj.alpha,
     ));
     CGFontRetain(env, env.objc.borrow::<CGContextHostObject>(context).font);
 }
@@ -294,6 +323,7 @@ fn CGContextRestoreGState(env: &mut Environment, context: CGContextRef) {
     host_obj.font = state.2;
     host_obj.font_size = state.3;
     host_obj.blend_mode = state.4;
+    host_obj.alpha = state.5;
 }
 
 fn CGContextSetInterpolationQuality(
@@ -432,6 +462,7 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CGContextRetain(_)),
     export_c_func!(CGContextRelease(_)),
     export_c_func!(CGContextSetBlendMode(_, _)),
+    export_c_func!(CGContextSetAlpha(_, _)),
     export_c_func!(CGContextSetFillColorSpace(_, _)),
     export_c_func!(CGContextSetFillColorWithColor(_, _)),
     export_c_func!(CGContextSetRGBFillColor(_, _, _, _, _)),
@@ -444,6 +475,8 @@ pub const FUNCTIONS: FunctionExports = &[
     export_c_func!(CGContextClipToRect(_, _)),
     export_c_func!(CGContextConcatCTM(_, _)),
     export_c_func!(CGContextGetCTM(_)),
+    export_c_func!(CGContextGetUserSpaceToDeviceSpaceTransform(_)),
+    export_c_func!(CGContextGetClipBoundingBox(_)),
     export_c_func!(CGContextRotateCTM(_, _)),
     export_c_func!(CGContextScaleCTM(_, _, _)),
     export_c_func!(CGContextTranslateCTM(_, _, _)),

@@ -1,0 +1,611 @@
+diff --git a/src/frameworks/core_graphics/cg_bitmap_context.rs b/src/frameworks/core_graphics/cg_bitmap_context.rs
+index 118e7f6c..2e9f4fbd 100644
+--- a/src/frameworks/core_graphics/cg_bitmap_context.rs
++++ b/src/frameworks/core_graphics/cg_bitmap_context.rs
+@@ -11,8 +11,8 @@ use super::cg_color_space::{
+ };
+ use super::cg_context::{
+     kCGBlendModeCopy, kCGBlendModeDarken, kCGBlendModeLighten, kCGBlendModeMultiply,
+-    kCGBlendModeNormal, kCGBlendModeScreen, CGBlendMode, CGContextHostObject, CGContextRef,
+-    CGContextSubclass,
++    kCGBlendModeNormal, kCGBlendModeScreen, kCGBlendModeSourceAtop, kCGBlendModeSourceIn,
++    CGBlendMode, CGContextHostObject, CGContextRef, CGContextSubclass,
+ };
+ use super::cg_image::{
+     self, kCGBitmapAlphaInfoMask, kCGBitmapByteOrderMask, kCGImageAlphaFirst, kCGImageAlphaLast,
+@@ -90,6 +90,7 @@ pub fn CGBitmapContextCreate(
+         font_size: 14.0,
+         transform: CGAffineTransformIdentity,
+         blend_mode: kCGBlendModeNormal,
++        alpha: 1.0,
+         text_transform: None,
+         state_stack: Vec::new(),
+     };
+@@ -251,6 +252,17 @@ fn blend_premultiplied(
+     if blend_mode == kCGBlendModeCopy {
+         return fg;
+     }
++    if blend_mode == kCGBlendModeSourceIn {
++        return (fg.0 * bg.3, fg.1 * bg.3, fg.2 * bg.3, fg.3 * bg.3);
++    }
++    if blend_mode == kCGBlendModeSourceAtop {
++        return (
++            fg.0 * bg.3 + bg.0 * (1.0 - fg.3),
++            fg.1 * bg.3 + bg.1 * (1.0 - fg.3),
++            fg.2 * bg.3 + bg.2 * (1.0 - fg.3),
++            bg.3,
++        );
++    }
+     // Blend
+     let blend_res = match blend_mode {
+         kCGBlendModeNormal => (bg.3 * fg.0, bg.3 * fg.1, bg.3 * fg.2),
+@@ -407,12 +419,70 @@ fn put_pixel(
+     }
+ }
+ 
++#[test]
++fn test_source_in() {
++    let fg = (0.4, 0.2, 0.1, 0.5);
++    assert_eq!(
++        blend_premultiplied((0.1, 0.1, 0.1, 0.5), fg, kCGBlendModeSourceIn),
++        (0.2, 0.1, 0.05, 0.25)
++    );
++    assert_eq!(
++        blend_premultiplied((0.0, 0.0, 0.0, 0.0), fg, kCGBlendModeSourceIn),
++        (0.0, 0.0, 0.0, 0.0)
++    );
++    assert_eq!(
++        blend_premultiplied((0.0, 0.0, 0.0, 1.0), fg, kCGBlendModeSourceIn),
++        fg
++    );
++}
++
++#[test]
++fn test_source_atop() {
++    let fg = (0.5, 0.0, 0.0, 0.5);
++    let bg = (0.0, 0.0, 0.5, 0.5);
++    assert_eq!(
++        blend_premultiplied(bg, fg, kCGBlendModeSourceAtop),
++        (0.25, 0.0, 0.25, 0.5)
++    );
++    assert_eq!(
++        blend_premultiplied((0.0, 0.0, 0.0, 0.0), fg, kCGBlendModeSourceAtop),
++        (0.0, 0.0, 0.0, 0.0)
++    );
++}
++
++fn apply_global_alpha(
++    pixel: (CGFloat, CGFloat, CGFloat, CGFloat),
++    alpha: CGFloat,
++    premultiplied: bool,
++) -> (CGFloat, CGFloat, CGFloat, CGFloat) {
++    if premultiplied {
++        (
++            pixel.0 * alpha,
++            pixel.1 * alpha,
++            pixel.2 * alpha,
++            pixel.3 * alpha,
++        )
++    } else {
++        (pixel.0, pixel.1, pixel.2, pixel.3 * alpha)
++    }
++}
++
++#[test]
++fn test_global_alpha() {
++    let pixel = (0.4, 0.2, 0.1, 0.5);
++    assert_eq!(apply_global_alpha(pixel, 1.0, true), pixel);
++    assert_eq!(apply_global_alpha(pixel, 0.5, true), (0.2, 0.1, 0.05, 0.25));
++    assert_eq!(apply_global_alpha(pixel, 0.5, false), (0.4, 0.2, 0.1, 0.25));
++    assert_eq!(apply_global_alpha(pixel, 0.0, true), (0.0, 0.0, 0.0, 0.0));
++}
++
+ /// Abstract interface for use by host code that wants to draw in a bitmap
+ /// context.
+ pub struct CGBitmapContextDrawer<'a> {
+     bitmap_info: CGBitmapContextData,
+     rgb_fill_color: (CGFloat, CGFloat, CGFloat, CGFloat),
+     blend_mode: CGBlendMode,
++    alpha: CGFloat,
+     transform: CGAffineTransform,
+     pixels: &'a mut [u8],
+ }
+@@ -427,6 +497,7 @@ impl CGBitmapContextDrawer<'_> {
+             rgb_fill_color,
+             transform,
+             blend_mode,
++            alpha,
+             ..
+         } = objc.borrow(context);
+ 
+@@ -436,6 +507,7 @@ impl CGBitmapContextDrawer<'_> {
+             bitmap_info,
+             rgb_fill_color,
+             blend_mode,
++            alpha,
+             transform,
+             pixels,
+         }
+@@ -473,6 +545,16 @@ impl CGBitmapContextDrawer<'_> {
+         color: (CGFloat, CGFloat, CGFloat, CGFloat),
+         blend: bool,
+     ) {
++        let color = if blend {
++            let premultiplied = matches!(
++                self.bitmap_info.alpha_info,
++                kCGImageAlphaPremultipliedLast | kCGImageAlphaPremultipliedFirst
++            );
++            apply_global_alpha(color, self.alpha, premultiplied)
++        } else {
++            // CGContextClearRect ignores the graphics state's alpha.
++            color
++        };
+         put_pixel(
+             &self.bitmap_info,
+             self.pixels,
+@@ -551,6 +633,7 @@ fn test_iter_transformed_pixels() {
+             },
+             rgb_fill_color: (0.0, 0.0, 0.0, 0.0),
+             blend_mode: kCGBlendModeNormal,
++            alpha: 1.0,
+             transform,
+             pixels: &mut [],
+         }
+diff --git a/src/frameworks/core_graphics/cg_context.rs b/src/frameworks/core_graphics/cg_context.rs
+index 897e2670..c30a685a 100644
+--- a/src/frameworks/core_graphics/cg_context.rs
++++ b/src/frameworks/core_graphics/cg_context.rs
+@@ -39,6 +39,8 @@ pub const kCGBlendModeOverlay: CGBlendMode = 3;
+ pub const kCGBlendModeDarken: CGBlendMode = 4;
+ pub const kCGBlendModeLighten: CGBlendMode = 5;
+ pub const kCGBlendModeCopy: CGBlendMode = 17;
++pub const kCGBlendModeSourceIn: CGBlendMode = 18;
++pub const kCGBlendModeSourceAtop: CGBlendMode = 20;
+ 
+ pub const CLASSES: ClassExports = objc_classes! {
+ 
+@@ -71,6 +73,7 @@ type ContextState = (
+     CGFontRef,                            // font
+     CGFloat,                              // font size
+     CGBlendMode,                          // blend mode
++    CGFloat,                              // global alpha
+ );
+ 
+ pub(super) struct CGContextHostObject {
+@@ -81,6 +84,7 @@ pub(super) struct CGContextHostObject {
+     /// Current transform.
+     pub(super) transform: CGAffineTransform,
+     pub(super) blend_mode: CGBlendMode,
++    pub(super) alpha: CGFloat,
+     /// Text transform.
+     pub(super) text_transform: Option<CGAffineTransform>,
+     pub(super) state_stack: Vec<ContextState>,
+@@ -112,6 +116,10 @@ fn CGContextSetBlendMode(env: &mut Environment, context: CGContextRef, blend_mod
+         .blend_mode = blend_mode;
+ }
+ 
++fn CGContextSetAlpha(env: &mut Environment, context: CGContextRef, alpha: CGFloat) {
++    env.objc.borrow_mut::<CGContextHostObject>(context).alpha = alpha.clamp(0.0, 1.0);
++}
++
+ fn CGContextSetFillColorSpace(
+     env: &mut Environment,
+     _context: CGContextRef,
+@@ -238,6 +246,26 @@ pub fn CGContextGetCTM(env: &mut Environment, context: CGContextRef) -> CGAffine
+     log_dbg!("CGContextGetCTM() => {:?}", res);
+     res
+ }
++fn CGContextGetUserSpaceToDeviceSpaceTransform(
++    env: &mut Environment,
++    context: CGContextRef,
++) -> CGAffineTransform {
++    // All contexts currently use bitmap coordinates as device coordinates.
++    CGContextGetCTM(env, context)
++}
++
++fn CGContextGetClipBoundingBox(env: &mut Environment, context: CGContextRef) -> CGRect {
++    // CGContextClipToRect currently only accepts the full bitmap extent.
++    let rect = CGRect {
++        origin: CGPointZero,
++        size: CGSize {
++            width: CGBitmapContextGetWidth(env, context) as CGFloat,
++            height: CGBitmapContextGetHeight(env, context) as CGFloat,
++        },
++    };
++    CGContextGetCTM(env, context).invert().apply_to_rect(rect)
++}
++
+ pub fn CGContextRotateCTM(env: &mut Environment, context: CGContextRef, angle: CGFloat) {
+     log_dbg!("CGContextRotateCTM({:?})", angle);
+     let host_obj = env.objc.borrow_mut::<CGContextHostObject>(context);
+@@ -276,6 +304,7 @@ fn CGContextSaveGState(env: &mut Environment, context: CGContextRef) {
+         host_obj.font,
+         host_obj.font_size,
+         host_obj.blend_mode,
++        host_obj.alpha,
+     ));
+     CGFontRetain(env, env.objc.borrow::<CGContextHostObject>(context).font);
+ }
+@@ -294,6 +323,7 @@ fn CGContextRestoreGState(env: &mut Environment, context: CGContextRef) {
+     host_obj.font = state.2;
+     host_obj.font_size = state.3;
+     host_obj.blend_mode = state.4;
++    host_obj.alpha = state.5;
+ }
+ 
+ fn CGContextSetInterpolationQuality(
+@@ -432,6 +462,7 @@ pub const FUNCTIONS: FunctionExports = &[
+     export_c_func!(CGContextRetain(_)),
+     export_c_func!(CGContextRelease(_)),
+     export_c_func!(CGContextSetBlendMode(_, _)),
++    export_c_func!(CGContextSetAlpha(_, _)),
+     export_c_func!(CGContextSetFillColorSpace(_, _)),
+     export_c_func!(CGContextSetFillColorWithColor(_, _)),
+     export_c_func!(CGContextSetRGBFillColor(_, _, _, _, _)),
+@@ -444,6 +475,8 @@ pub const FUNCTIONS: FunctionExports = &[
+     export_c_func!(CGContextClipToRect(_, _)),
+     export_c_func!(CGContextConcatCTM(_, _)),
+     export_c_func!(CGContextGetCTM(_)),
++    export_c_func!(CGContextGetUserSpaceToDeviceSpaceTransform(_)),
++    export_c_func!(CGContextGetClipBoundingBox(_)),
+     export_c_func!(CGContextRotateCTM(_, _)),
+     export_c_func!(CGContextScaleCTM(_, _, _)),
+     export_c_func!(CGContextTranslateCTM(_, _, _)),
+diff --git a/src/frameworks/uikit.rs b/src/frameworks/uikit.rs
+index c8e67732..8fdacf1d 100644
+--- a/src/frameworks/uikit.rs
++++ b/src/frameworks/uikit.rs
+@@ -15,6 +15,7 @@ use std::time::Instant;
+ pub mod ui_accelerometer;
+ pub mod ui_activity_indicator_view;
+ pub mod ui_application;
++pub mod ui_bar_button_item;
+ pub mod ui_color;
+ pub mod ui_device;
+ pub mod ui_event;
+@@ -39,6 +40,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
+         ui_accelerometer::CLASSES,
+         ui_activity_indicator_view::CLASSES,
+         ui_application::CLASSES,
++        ui_bar_button_item::CLASSES,
+         ui_color::CLASSES,
+         ui_device::CLASSES,
+         ui_event::CLASSES,
+@@ -65,6 +67,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
+         ui_view::ui_picker_view::CLASSES,
+         ui_view::ui_scroll_view::CLASSES,
+         ui_view::ui_scroll_view::ui_text_view::CLASSES,
++        ui_view::ui_toolbar::CLASSES,
+         ui_view::ui_web_view::CLASSES,
+         ui_view::ui_window::CLASSES,
+         ui_view_controller::CLASSES,
+diff --git a/src/frameworks/uikit/ui_bar_button_item.rs b/src/frameworks/uikit/ui_bar_button_item.rs
+new file mode 100644
+index 00000000..172df3d8
+--- /dev/null
++++ b/src/frameworks/uikit/ui_bar_button_item.rs
+@@ -0,0 +1,155 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
++ */
++//! Early UIKit toolbar items. Based on Apple's public UIBarButtonItem docs.
++
++use crate::abi::GuestArg;
++use crate::frameworks::core_graphics::CGFloat;
++use crate::frameworks::foundation::ns_string::get_static_str;
++use crate::frameworks::foundation::NSInteger;
++use crate::frameworks::uikit::ui_view::ui_control::UIControlEventTouchUpInside;
++use crate::objc::{
++    id, msg, msg_class, msg_send, msg_super, nil, objc_classes, release, retain, ClassExports,
++    HostObject, NSZonePtr, SEL,
++};
++use crate::Environment;
++
++pub(super) struct ItemHostObject {
++    pub(super) button: id,
++    pub(super) system: Option<NSInteger>,
++    pub(super) width: CGFloat,
++    title: id,
++    target: id, // weak
++    action: Option<SEL>,
++    style: NSInteger,
++    enabled: bool,
++}
++impl HostObject for ItemHostObject {}
++impl Default for ItemHostObject {
++    fn default() -> Self {
++        Self {
++            button: nil,
++            system: None,
++            width: 0.0,
++            title: nil,
++            target: nil,
++            action: None,
++            style: 0,
++            enabled: true,
++        }
++    }
++}
++
++fn make_button(env: &mut Environment, this: id) {
++    let button: id = msg_class![env; UIButton new];
++    let action = env
++        .objc
++        .register_host_selector("_touchHLE_activate".into(), &mut env.mem);
++    () = msg![env; button addTarget:this action:action
++        forControlEvents:UIControlEventTouchUpInside];
++    env.objc.borrow_mut::<ItemHostObject>(this).button = button;
++}
++
++pub const CLASSES: ClassExports = objc_classes! {
++(env, this, _cmd);
++
++@implementation UIBarItem: NSObject
++@end
++
++@implementation UIBarButtonItem: UIBarItem
++
+++ (id)allocWithZone:(NSZonePtr)_zone {
++    env.objc.alloc_object(this, Box::<ItemHostObject>::default(), &mut env.mem)
++}
++- (id)init {
++    make_button(env, this);
++    this
++}
++- (id)initWithTitle:(id)title style:(NSInteger)style
++              target:(id)target action:(SEL)action {
++    let this: id = msg![env; this init];
++    () = msg![env; this setTitle:title];
++    let item = env.objc.borrow_mut::<ItemHostObject>(this);
++    item.style = style;
++    item.target = target;
++    item.action = Some(action);
++    this
++}
++- (id)initWithBarButtonSystemItem:(NSInteger)system
++                          target:(id)target action:(SEL)action {
++    let this: id = msg![env; this init];
++    let title = match system {
++        0 => "Done", 1 => "Cancel", 2 => "Edit", 3 => "Save", 4 => "+",
++        5 | 6 => "", 7 => "Compose", 8 => "Reply", 9 => "Action",
++        10 => "Organize", 11 => "Bookmarks", 12 => "Search",
++        13 => "Refresh", 14 => "Stop", 15 => "Camera", 16 => "Trash",
++        17 => "Play", 18 => "Pause", 19 => "Rewind", 20 => "Fast forward",
++        _ => { log!("TODO: toolbar system item {}", system); "?" }
++    };
++    let title = get_static_str(env, title);
++    () = msg![env; this setTitle:title];
++    let item = env.objc.borrow_mut::<ItemHostObject>(this);
++    item.system = Some(system);
++    item.target = target;
++    item.action = Some(action);
++    this
++}
++- (())dealloc {
++    let item = std::mem::take(env.objc.borrow_mut::<ItemHostObject>(this));
++    release(env, item.title);
++    release(env, item.button);
++    msg_super![env; this dealloc]
++}
++- (id)title { env.objc.borrow::<ItemHostObject>(this).title }
++- (())setTitle:(id)title {
++    let title: id = msg![env; title copy];
++    let item = env.objc.borrow_mut::<ItemHostObject>(this);
++    let old = std::mem::replace(&mut item.title, title);
++    let button = item.button;
++    release(env, old);
++    () = msg![env; button setTitle:title forState:0u32];
++}
++- (CGFloat)width { env.objc.borrow::<ItemHostObject>(this).width }
++- (())setWidth:(CGFloat)width {
++    env.objc.borrow_mut::<ItemHostObject>(this).width = width.max(0.0);
++}
++- (NSInteger)style { env.objc.borrow::<ItemHostObject>(this).style }
++- (())setStyle:(NSInteger)style { env.objc.borrow_mut::<ItemHostObject>(this).style = style; }
++- (id)target { env.objc.borrow::<ItemHostObject>(this).target }
++- (())setTarget:(id)target { env.objc.borrow_mut::<ItemHostObject>(this).target = target; }
++- (SEL)action {
++    env.objc.borrow::<ItemHostObject>(this).action.unwrap_or_else(||
++        <SEL as GuestArg>::from_regs(&[0]))
++}
++- (())setAction:(SEL)action { env.objc.borrow_mut::<ItemHostObject>(this).action = Some(action); }
++- (bool)isEnabled { env.objc.borrow::<ItemHostObject>(this).enabled }
++- (())setEnabled:(bool)enabled {
++    let item = env.objc.borrow_mut::<ItemHostObject>(this);
++    item.enabled = enabled;
++    let button = item.button;
++    () = msg![env; button setEnabled:enabled];
++}
++- (())_touchHLE_activate {
++    let item = env.objc.borrow::<ItemHostObject>(this);
++    let (target, action, enabled) = (item.target, item.action, item.enabled);
++    if !enabled { return; }
++    if let Some(action) = action.filter(|action| !action.is_null()) {
++        if target == nil {
++            log!("TODO: toolbar action via responder chain");
++            return;
++        }
++        // The sender is the bar item, not its backing UIButton.
++        let count = action.as_str(&env.mem).bytes().filter(|b| *b == b':').count();
++        retain(env, this);
++        match count {
++            0 => { () = msg_send(env, (target, action)); }
++            1 => { () = msg_send(env, (target, action, this)); }
++            _ => { log!("Unsupported toolbar action {:?}", action); }
++        }
++        release(env, this);
++    }
++}
++@end
++};
+diff --git a/src/frameworks/uikit/ui_view.rs b/src/frameworks/uikit/ui_view.rs
+index b4dc3af0..d373e428 100644
+--- a/src/frameworks/uikit/ui_view.rs
++++ b/src/frameworks/uikit/ui_view.rs
+@@ -15,6 +15,7 @@ pub mod ui_label;
+ pub mod ui_page_control;
+ pub mod ui_picker_view;
+ pub mod ui_scroll_view;
++pub mod ui_toolbar;
+ pub mod ui_web_view;
+ pub mod ui_window;
+ 
+diff --git a/src/frameworks/uikit/ui_view/ui_toolbar.rs b/src/frameworks/uikit/ui_view/ui_toolbar.rs
+new file mode 100644
+index 00000000..19a4c1ba
+--- /dev/null
++++ b/src/frameworks/uikit/ui_view/ui_toolbar.rs
+@@ -0,0 +1,151 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
++ */
++//! Early UIKit toolbar support. Native gradients and animation remain TODO.
++
++use super::UIViewHostObject;
++use crate::frameworks::core_graphics::{CGPoint, CGRect, CGSize};
++use crate::frameworks::foundation::{NSInteger, NSUInteger};
++use crate::frameworks::uikit::ui_bar_button_item::ItemHostObject;
++use crate::objc::{
++    id, impl_HostObject_with_superclass, msg, msg_class, msg_super, nil, objc_classes, release,
++    ClassExports, NSZonePtr,
++};
++use crate::Environment;
++
++#[derive(Default)]
++struct ToolbarHostObject {
++    superclass: UIViewHostObject,
++    items: id,
++    style: NSInteger,
++    translucent: bool,
++}
++impl_HostObject_with_superclass!(ToolbarHostObject);
++
++fn items(env: &mut Environment, this: id) -> Vec<id> {
++    let array = env.objc.borrow::<ToolbarHostObject>(this).items;
++    if array == nil {
++        return Vec::new();
++    }
++    let count: NSUInteger = msg![env; array count];
++    (0..count)
++        .map(|i| msg![env; array objectAtIndex:i])
++        .collect()
++}
++
++fn layout(env: &mut Environment, this: id) {
++    let bounds: CGRect = msg![env; this bounds];
++    let entries = items(env, this);
++    let mut fixed = 0.0f32;
++    let mut flexible = 0;
++    let widths: Vec<_> = entries
++        .iter()
++        .map(|&entry| {
++            let item = env.objc.borrow::<ItemHostObject>(entry);
++            let width = match item.system {
++                Some(5) => {
++                    flexible += 1;
++                    0.0
++                }
++                Some(6) => item.width,
++                _ if item.width > 0.0 => item.width,
++                _ => 72.0,
++            };
++            fixed += width;
++            width
++        })
++        .collect();
++    let gap = if flexible > 0 {
++        ((bounds.size.width - 12.0 - fixed) / flexible as f32).max(0.0)
++    } else {
++        0.0
++    };
++    let mut x = bounds.origin.x + 6.0;
++    for (entry, mut width) in entries.into_iter().zip(widths) {
++        let item = env.objc.borrow::<ItemHostObject>(entry);
++        let button = item.button;
++        let spacer = matches!(item.system, Some(5 | 6));
++        if item.system == Some(5) {
++            width = gap;
++        }
++        if !spacer {
++            let frame = CGRect {
++                origin: CGPoint {
++                    x,
++                    y: bounds.origin.y + 4.0,
++                },
++                size: CGSize {
++                    width,
++                    height: (bounds.size.height - 8.0).max(0.0),
++                },
++            };
++            () = msg![env; button setFrame:frame];
++        }
++        x += width;
++    }
++}
++
++pub const CLASSES: ClassExports = objc_classes! {
++(env, this, _cmd);
++@implementation UIToolbar: UIView
+++ (id)allocWithZone:(NSZonePtr)_zone {
++    env.objc.alloc_object(this, Box::<ToolbarHostObject>::default(), &mut env.mem)
++}
++- (id)initWithFrame:(CGRect)frame {
++    let this: id = msg_super![env; this initWithFrame:frame];
++    () = msg![env; this setBarStyle:0i32];
++    this
++}
++- (())dealloc {
++    let array = std::mem::replace(&mut env.objc.borrow_mut::<ToolbarHostObject>(this).items, nil);
++    release(env, array);
++    msg_super![env; this dealloc]
++}
++- (id)items { env.objc.borrow::<ToolbarHostObject>(this).items }
++- (())setItems:(id)array {
++    () = msg![env; this setItems:array animated:false];
++}
++- (())setItems:(id)array animated:(bool)animated {
++    if animated { log!("TODO: animated toolbar item changes"); }
++    let copy: id = msg![env; array copy];
++    for entry in items(env, this) {
++        let button = env.objc.borrow::<ItemHostObject>(entry).button;
++        () = msg![env; button removeFromSuperview];
++    }
++    let old = std::mem::replace(&mut env.objc.borrow_mut::<ToolbarHostObject>(this).items, copy);
++    release(env, old);
++    for entry in items(env, this) {
++        let item = env.objc.borrow::<ItemHostObject>(entry);
++        let (button, spacer) = (item.button, matches!(item.system, Some(5 | 6)));
++        if !spacer { () = msg![env; this addSubview:button]; }
++    }
++    layout(env, this);
++}
++- (NSInteger)barStyle { env.objc.borrow::<ToolbarHostObject>(this).style }
++- (())setBarStyle:(NSInteger)style {
++    env.objc.borrow_mut::<ToolbarHostObject>(this).style = style;
++    let color: id = if style == 0 { msg_class![env; UIColor grayColor] }
++        else { msg_class![env; UIColor blackColor] };
++    () = msg![env; this setBackgroundColor:color];
++}
++- (bool)isTranslucent { env.objc.borrow::<ToolbarHostObject>(this).translucent }
++- (())setTranslucent:(bool)translucent {
++    env.objc.borrow_mut::<ToolbarHostObject>(this).translucent = translucent;
++    // Keep the toolbar opaque until compositing matches early UIKit.
++    log!("TODO: toolbar translucency {}", translucent);
++}
++- (CGSize)sizeThatFits:(CGSize)size { CGSize { width: size.width, height: 44.0 } }
++- (())sizeToFit {
++    let mut frame: CGRect = msg![env; this frame];
++    frame.size.height = 44.0;
++    () = msg![env; this setFrame:frame];
++}
++- (())setFrame:(CGRect)frame {
++    () = msg_super![env; this setFrame:frame];
++    layout(env, this);
++}
++- (())layoutSubviews { layout(env, this); }
++@end
++};

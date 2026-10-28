@@ -1,5 +1,6 @@
 /target
 /vendor/boost
+/vendor/boost-*/
 /touchHLE_sandbox
 /touchHLE_apps
 touchHLE_log.txt
